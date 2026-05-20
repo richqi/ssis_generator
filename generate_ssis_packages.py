@@ -211,8 +211,8 @@ def generate_package_sql(package_index, source_table, source_columns):
     create_dim = [
         f"CREATE TABLE [{schema_name}].[{dim_name}] (",
         "    [DimKey] INT IDENTITY(1,1) NOT NULL",
-        "    [SourceId] INT NOT NULL",
-        "    [LoadDate] DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME()",
+        "    ,[SourceId] INT NOT NULL",
+        "    ,[LoadDate] DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME()",
     ]
     for col in dims:
         create_dim.append(f"    ,[{col['column_name']}] {simplify_type(col)} NULL")
@@ -222,8 +222,8 @@ def generate_package_sql(package_index, source_table, source_columns):
     create_fact = [
         f"CREATE TABLE [{schema_name}].[{fact_name}] (",
         "    [FactKey] BIGINT IDENTITY(1,1) NOT NULL",
-        "    [DimKey] INT NOT NULL",
-        "    [LoadDate] DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME()",
+        "    ,[DimKey] INT NOT NULL",
+        "    ,[LoadDate] DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME()",
     ]
     for col in source_columns:
         if col["column_name"] in [d["column_name"] for d in dims]:
@@ -244,17 +244,24 @@ def generate_package_sql(package_index, source_table, source_columns):
     insert_fact = [f"INSERT INTO [{schema_name}].[{fact_name}] ([DimKey], [LoadDate]"
                    + ("" if not source_columns else ", " + ", ".join(f"[{c['column_name']}]" for c in source_columns if c["column_name"] not in [d["column_name"] for d in dims]))
                    + ")",
-                   "SELECT d.[DimKey], SYSUTCDATETIME() AS [LoadDate]",
+                   "SELECT d.[DimKey], SYSUTCDATETIME() AS [LoadDate],",
                    ", ".join(f"s.[{c['column_name']}]" for c in source_columns if c["column_name"] not in [d["column_name"] for d in dims]),
                    f"FROM [{source_table['schema_name']}].[{source_table['object_name']}] AS s",
                    f"JOIN [{schema_name}].[{dim_name}] AS d ON d.[SourceId] = s.[ID]"]
 
     if not any(col["column_name"].upper() == "ID" for col in source_columns):
-        insert_dim[1] = f"SELECT DISTINCT ROW_NUMBER() OVER (ORDER BY (SELECT 1)) AS [SourceId], SYSUTCDATETIME() AS [LoadDate]"
+        insert_dim[1] = (
+            f"SELECT DISTINCT ROW_NUMBER() OVER (ORDER BY (SELECT 1)) AS [SourceId], SYSUTCDATETIME() AS [LoadDate]"
+            + ("" if not dims else ", " + ", ".join(f"[{c['column_name']}]" for c in dims))
+        )
         insert_dim[2] = f"FROM [{source_table['schema_name']}].[{source_table['object_name']}]"
         insert_dim[3] = "WHERE 1=1;"
-        insert_fact[0] = f"INSERT INTO [{schema_name}].[{fact_name}] ([DimKey], [LoadDate]"
-        insert_fact[1] = "SELECT d.[DimKey], SYSUTCDATETIME() AS [LoadDate]"
+        insert_fact[0] = (
+            f"INSERT INTO [{schema_name}].[{fact_name}] ([DimKey], [LoadDate]"
+            + ("" if not source_columns else ", " + ", ".join(f"[{c['column_name']}]" for c in source_columns if c["column_name"] not in [d["column_name"] for d in dims]))
+            + ")"
+        )
+        insert_fact[1] = "SELECT d.[DimKey], SYSUTCDATETIME() AS [LoadDate],"
         insert_fact[2] = ", ".join(f"s.[{c['column_name']}]" for c in source_columns if c["column_name"] not in [d["column_name"] for d in dims])
         insert_fact[3] = f"FROM [{source_table['schema_name']}].[{source_table['object_name']}] AS s"
         insert_fact[4] = f"CROSS JOIN (SELECT TOP 1 [DimKey] FROM [{schema_name}].[{dim_name}] ORDER BY [DimKey]) AS d"

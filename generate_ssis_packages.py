@@ -67,6 +67,11 @@ def build_connection_string(server: str, database: str, trusted: bool, username:
     return f"DRIVER={{ODBC Driver 18 for SQL Server}};SERVER={server};DATABASE={database};UID={username};PWD={password};Encrypt=no"
 
 
+def _fetchall_as_dicts(cursor):
+    cols = [col[0] for col in cursor.description]
+    return [dict(zip(cols, row)) for row in cursor.fetchall()]
+
+
 def query_metadata(cursor):
     metadata = {
         "tables": [],
@@ -86,7 +91,7 @@ def query_metadata(cursor):
         ",".join("?" for _ in SYSTEM_SCHEMAS)
     )
     cursor.execute(table_sql, tuple(SYSTEM_SCHEMAS))
-    metadata["tables"] = [dict(row) for row in cursor.fetchall()]
+    metadata["tables"] = _fetchall_as_dicts(cursor)
 
     view_sql = """
         SELECT s.name AS schema_name,
@@ -99,7 +104,7 @@ def query_metadata(cursor):
         ",".join("?" for _ in SYSTEM_SCHEMAS)
     )
     cursor.execute(view_sql, tuple(SYSTEM_SCHEMAS))
-    metadata["views"] = [dict(row) for row in cursor.fetchall()]
+    metadata["views"] = _fetchall_as_dicts(cursor)
 
     scalar_fn_sql = """
         SELECT s.name AS schema_name,
@@ -113,7 +118,7 @@ def query_metadata(cursor):
         ",".join("?" for _ in SYSTEM_SCHEMAS)
     )
     cursor.execute(scalar_fn_sql, tuple(SYSTEM_SCHEMAS))
-    metadata["functions"] = [dict(row) for row in cursor.fetchall()]
+    metadata["functions"] = _fetchall_as_dicts(cursor)
 
     proc_sql = """
         SELECT s.name AS schema_name,
@@ -127,7 +132,7 @@ def query_metadata(cursor):
         ",".join("?" for _ in SYSTEM_SCHEMAS)
     )
     cursor.execute(proc_sql, tuple(SYSTEM_SCHEMAS))
-    metadata["procedures"] = [dict(row) for row in cursor.fetchall()]
+    metadata["procedures"] = _fetchall_as_dicts(cursor)
 
     return metadata
 
@@ -147,7 +152,7 @@ def get_table_columns(cursor, schema_name, table_name):
          ORDER BY c.column_id
     """
     cursor.execute(sql, f"[{schema_name}].[{table_name}]")
-    return [dict(row) for row in cursor.fetchall()]
+    return _fetchall_as_dicts(cursor)
 
 
 def simplify_type(column):
@@ -300,7 +305,6 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
 
     with pyodbc.connect(conn_str, autocommit=True) as conn:
-        conn.row_factory = pyodbc.Row
         cursor = conn.cursor()
         metadata = query_metadata(cursor)
 

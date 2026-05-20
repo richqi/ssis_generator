@@ -1,21 +1,21 @@
-"""Tests for generate_ssis_packages.py SQL output generation.
+"""Tests for generate_ssis_packages.py SQL and Biml output generation.
 
 Covers pure functions — no database connection required:
   simplify_type, render_column_def, choose_dimension_columns,
-  choose_fact_source, generate_package_sql, build_connection_string.
-
-Known bug documented in TestGeneratePackageSqlWithoutId:
-  generate_package_sql raises IndexError when the source table has no
-  column named exactly "ID" (case-insensitive match via .upper() == "ID").
-  The no-ID branch sets insert_dim[4] but the list has only indices 0–3.
+  choose_fact_source, generate_package_sql, generate_package_biml,
+  _build_sql_batches, build_connection_string.
 """
+
+import xml.etree.ElementTree as ET
 
 import pytest
 
 from generate_ssis_packages import (
+    _build_sql_batches,
     build_connection_string,
     choose_dimension_columns,
     choose_fact_source,
+    generate_package_biml,
     generate_package_sql,
     render_column_def,
     simplify_type,
@@ -397,3 +397,148 @@ class TestBuildConnectionString:
         # password="" passes the `is None` check — documents current permissive behaviour
         cs = build_connection_string("s", "d", trusted=False, username="user", password="")
         assert "UID=user" in cs
+
+
+# ---------------------------------------------------------------------------
+# _build_sql_batches
+# ---------------------------------------------------------------------------
+
+_CONN = "Provider=SQLNCLI11;Server=myserver;Database=DW;Trusted_Connection=yes;"
+
+
+class TestBuildSqlBatches:
+    def setup_method(self):
+        self.batches = _build_sql_batches(0, _TABLE_WITH_ID, _COLS_WITH_ID)
+
+    def test_returns_seven_batches(self):
+        assert len(self.batches) == 7
+
+    def test_all_items_are_name_sql_pairs(self):
+        for name, sql in self.batches:
+            assert isinstance(name, str) and isinstance(sql, str)
+
+    def test_batch_names_in_order(self):
+        names = [n for n, _ in self.batches]
+        assert names[0] == "Create datawarehouse schema"
+        assert names[1] == "Drop dim_orders"
+        assert names[2] == "Create dim_orders"
+        assert names[3] == "Drop fact_orders"
+        assert names[4] == "Create fact_orders"
+        assert names[5] == "Load dim_orders"
+        assert names[6] == "Load fact_orders"
+
+    def test_dim_load_sql_contains_load_dimension_comment(self):
+        _, sql = self.batches[5]
+        assert "-- Load dimension data" in sql
+
+    def test_fact_load_sql_contains_load_fact_comment(self):
+        _, sql = self.batches[6]
+        assert "-- Load fact data" in sql
+
+    def test_no_go_separators_in_any_batch(self):
+        for _name, sql in self.batches:
+            assert "\nGO" not in sql
+
+
+# ---------------------------------------------------------------------------
+# generate_package_biml — with ID column
+# ---------------------------------------------------------------------------
+
+_NS = "http://schemas.varigence.com/biml.xsd"
+_NM = {"b": _NS}  # namespace map for XPath
+
+
+def _q(local):
+    """Return Clark-notation tag for a Biml element."""
+    return f"{{{_NS}}}{local}"
+
+
+class TestGeneratePackageBimlWithId:
+    def setup_method(self):
+        self.biml = generate_package_biml(0, _TABLE_WITH_ID, _COLS_WITH_ID, _CONN)
+        self.root = ET.fromstring(self.biml.split("\n", 1)[1])  # strip XML declaration
+
+    def test_output_is_valid_xml(self):
+        ET.fromstring(self.biml.split("\n", 1)[1])
+
+    def test_root_element_is_biml(self):
+        assert self.root.tag == _q("Biml")
+
+    def test_biml_namespace_in_serialised_output(self):
+        assert f'xmlns="{_NS}"' in self.biml
+
+    def test_connection_string_embedded(self):
+        conn = self.root.find(f".//{_q('OleDbConnection')}")
+        assert conn is not None
+        assert conn.get("ConnectionString") == _CONN
+
+    def test_connection_name_is_dw(self):
+        conn = self.root.find(f".//{_q('OleDbConnection')}")
+        assert conn.get("Name") == "DW"
+
+    def test_package_name_matches_index(self):
+        pkg = self.root.find(f".//{_q('Package')}")
+        assert pkg.get("Name") == "package_01"
+
+    def test_package_constraint_mode_linear(self):
+        pkg = self.root.find(f".//{_q('Package')}")
+        assert pkg.get("ConstraintMode") == "Linear"
+
+    def test_seven_execute_sql_tasks(self):
+        tasks = self.root.findall(f".//{_q('ExecuteSQL')}")
+        assert len(tasks) == 7
+
+    def test_all_tasks_reference_dw_connection(self):
+        for t in self.root.findall(f".//{_q('ExecuteSQL')}"):
+            assert t.get("ConnectionName") == "DW"
+
+    def test_each_task_has_direct_input(self):
+        for t in self.root.findall(f".//{_q('ExecuteSQL')}"):
+            di = t.find(_q("DirectInput"))
+            assert di is not None and di.text
+
+    def test_dim_task_precedes_fact_task(self):
+        names = [t.get("Name") for t in self.root.findall(f".//{_q('ExecuteSQL')}")]
+        assert names.index("Load dim_orders") < names.index("Load fact_orders")
+
+    def test_sql_content_round_trips_correctly(self):
+        # SQL with special chars (e.g. < in IF NOT EXISTS) must survive XML escaping.
+        first_task = self.root.findall(f".//{_q('ExecuteSQL')}")[0]
+        assert first_task.find(_q("DirectInput")).text is not None
+
+    def test_create_schema_sql_in_first_task(self):
+        task = self.root.findall(f".//{_q('ExecuteSQL')}")[0]
+        assert "CREATE SCHEMA" in task.find(_q("DirectInput")).text
+
+    def test_xml_declaration_present(self):
+        assert self.biml.startswith('<?xml version="1.0" encoding="utf-8"?>')
+
+
+# ---------------------------------------------------------------------------
+# generate_package_biml — without ID column
+# ---------------------------------------------------------------------------
+
+class TestGeneratePackageBimlWithoutId:
+    def setup_method(self):
+        self.biml = generate_package_biml(2, _TABLE_NO_ID, _COLS_NO_ID, _CONN)
+        self.root = ET.fromstring(self.biml.split("\n", 1)[1])
+
+    def test_output_is_valid_xml(self):
+        ET.fromstring(self.biml.split("\n", 1)[1])
+
+    def test_package_name_reflects_index(self):
+        pkg = self.root.find(f".//{_q('Package')}")
+        assert pkg.get("Name") == "package_03"
+
+    def test_seven_tasks_generated(self):
+        assert len(self.root.findall(f".//{_q('ExecuteSQL')}")) == 7
+
+    def test_cross_join_in_fact_load_task(self):
+        tasks = self.root.findall(f".//{_q('ExecuteSQL')}")
+        fact_task = next(t for t in tasks if t.get("Name") == "Load fact_contacts")
+        assert "CROSS JOIN" in fact_task.find(_q("DirectInput")).text
+
+    def test_row_number_in_dim_load_task(self):
+        tasks = self.root.findall(f".//{_q('ExecuteSQL')}")
+        dim_task = next(t for t in tasks if t.get("Name") == "Load dim_contacts")
+        assert "ROW_NUMBER()" in dim_task.find(_q("DirectInput")).text

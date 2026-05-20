@@ -21,6 +21,7 @@ import os
 import pathlib
 import re
 import sys
+import xml.etree.ElementTree as ET
 
 try:
     import pyodbc
@@ -56,6 +57,10 @@ def parse_args():
     parser.add_argument("--package-count", required=True, type=int, help="Number of SQL package scripts to generate")
     parser.add_argument("--output-dir", default="ssis_sql_packages", help="Output folder for generated .sql packages")
     parser.add_argument("--include-views", action="store_true", help="Also analyze views when building package metadata")
+    parser.add_argument("--output-format", choices=["sql", "biml"], default="sql",
+                        help="Output format: sql (default) or biml")
+    parser.add_argument("--dw-connection",
+                        help="OLE DB connection string embedded in Biml output (required when --output-format=biml)")
     return parser.parse_args()
 
 
@@ -199,15 +204,23 @@ def choose_dimension_columns(columns):
     return dims
 
 
-def generate_package_sql(package_index, source_table, source_columns):
+def _build_sql_batches(package_index, source_table, source_columns):
+    """Return ordered list of (task_name, sql_text) pairs for one package.
+
+    Each pair maps to one GO-separated batch in SQL output or one
+    ExecuteSQL task in Biml output.
+    """
     schema_name = "datawarehouse"
-    package_id = package_index + 1
     table_base = re.sub(r"[^0-9A-Za-z_]+", "_", source_table["object_name"]).lower()
     dim_name = f"dim_{table_base}"
     fact_name = f"fact_{table_base}"
     dims = choose_dimension_columns(source_columns)
 
-    create_schema = f"IF NOT EXISTS (SELECT 1 FROM sys.schemas WHERE name = '{schema_name}')\nEXEC('CREATE SCHEMA [{schema_name}]');"
+    create_schema = (
+        f"IF NOT EXISTS (SELECT 1 FROM sys.schemas WHERE name = '{schema_name}')\n"
+        f"EXEC('CREATE SCHEMA [{schema_name}]');"
+    )
+
     create_dim = [
         f"CREATE TABLE [{schema_name}].[{dim_name}] (",
         "    [DimKey] INT IDENTITY(1,1) NOT NULL",
@@ -230,24 +243,37 @@ def generate_package_sql(package_index, source_table, source_columns):
             continue
         create_fact.append(f"    ,[{col['column_name']}] {simplify_type(col)} NULL")
     create_fact.append(f"    ,CONSTRAINT [PK_{fact_name}] PRIMARY KEY CLUSTERED ([FactKey])")
-    create_fact.append(f"    ,CONSTRAINT [FK_{fact_name}_{dim_name}] FOREIGN KEY ([DimKey]) REFERENCES [{schema_name}].[{dim_name}]([DimKey])")
+    create_fact.append(
+        f"    ,CONSTRAINT [FK_{fact_name}_{dim_name}] FOREIGN KEY ([DimKey])"
+        f" REFERENCES [{schema_name}].[{dim_name}]([DimKey])"
+    )
     create_fact.append(") ON [PRIMARY];")
 
-    insert_dim = [f"INSERT INTO [{schema_name}].[{dim_name}] ([SourceId], [LoadDate]"
-                  + ("" if not dims else ", " + ", ".join(f"[{c['column_name']}]" for c in dims))
-                  + ")",
-                  f"SELECT DISTINCT [ID] AS [SourceId], SYSUTCDATETIME() AS [LoadDate]"
-                  + ("" if not dims else ", " + ", ".join(f"[{c['column_name']}]" for c in dims)),
-                  f"FROM [{source_table['schema_name']}].[{source_table['object_name']}]",
-                  "WHERE [ID] IS NOT NULL;"]
+    insert_dim = [
+        f"INSERT INTO [{schema_name}].[{dim_name}] ([SourceId], [LoadDate]"
+        + ("" if not dims else ", " + ", ".join(f"[{c['column_name']}]" for c in dims))
+        + ")",
+        f"SELECT DISTINCT [ID] AS [SourceId], SYSUTCDATETIME() AS [LoadDate]"
+        + ("" if not dims else ", " + ", ".join(f"[{c['column_name']}]" for c in dims)),
+        f"FROM [{source_table['schema_name']}].[{source_table['object_name']}]",
+        "WHERE [ID] IS NOT NULL;",
+    ]
 
-    insert_fact = [f"INSERT INTO [{schema_name}].[{fact_name}] ([DimKey], [LoadDate]"
-                   + ("" if not source_columns else ", " + ", ".join(f"[{c['column_name']}]" for c in source_columns if c["column_name"] not in [d["column_name"] for d in dims]))
-                   + ")",
-                   "SELECT d.[DimKey], SYSUTCDATETIME() AS [LoadDate],",
-                   ", ".join(f"s.[{c['column_name']}]" for c in source_columns if c["column_name"] not in [d["column_name"] for d in dims]),
-                   f"FROM [{source_table['schema_name']}].[{source_table['object_name']}] AS s",
-                   f"JOIN [{schema_name}].[{dim_name}] AS d ON d.[SourceId] = s.[ID]"]
+    insert_fact = [
+        f"INSERT INTO [{schema_name}].[{fact_name}] ([DimKey], [LoadDate]"
+        + ("" if not source_columns else ", " + ", ".join(
+            f"[{c['column_name']}]" for c in source_columns
+            if c["column_name"] not in [d["column_name"] for d in dims]
+        ))
+        + ")",
+        "SELECT d.[DimKey], SYSUTCDATETIME() AS [LoadDate],",
+        ", ".join(
+            f"s.[{c['column_name']}]" for c in source_columns
+            if c["column_name"] not in [d["column_name"] for d in dims]
+        ),
+        f"FROM [{source_table['schema_name']}].[{source_table['object_name']}] AS s",
+        f"JOIN [{schema_name}].[{dim_name}] AS d ON d.[SourceId] = s.[ID]",
+    ]
 
     if not any(col["column_name"].upper() == "ID" for col in source_columns):
         insert_dim[1] = (
@@ -258,36 +284,66 @@ def generate_package_sql(package_index, source_table, source_columns):
         insert_dim[3] = "WHERE 1=1;"
         insert_fact[0] = (
             f"INSERT INTO [{schema_name}].[{fact_name}] ([DimKey], [LoadDate]"
-            + ("" if not source_columns else ", " + ", ".join(f"[{c['column_name']}]" for c in source_columns if c["column_name"] not in [d["column_name"] for d in dims]))
+            + ("" if not source_columns else ", " + ", ".join(
+                f"[{c['column_name']}]" for c in source_columns
+                if c["column_name"] not in [d["column_name"] for d in dims]
+            ))
             + ")"
         )
         insert_fact[1] = "SELECT d.[DimKey], SYSUTCDATETIME() AS [LoadDate],"
-        insert_fact[2] = ", ".join(f"s.[{c['column_name']}]" for c in source_columns if c["column_name"] not in [d["column_name"] for d in dims])
+        insert_fact[2] = ", ".join(
+            f"s.[{c['column_name']}]" for c in source_columns
+            if c["column_name"] not in [d["column_name"] for d in dims]
+        )
         insert_fact[3] = f"FROM [{source_table['schema_name']}].[{source_table['object_name']}] AS s"
         insert_fact[4] = f"CROSS JOIN (SELECT TOP 1 [DimKey] FROM [{schema_name}].[{dim_name}] ORDER BY [DimKey]) AS d"
 
-    script_lines = [
-        "SET NOCOUNT ON;",
-        "GO",
-        create_schema,
-        "GO",
-        "IF OBJECT_ID(N'[{0}].[{1}]', N'U') IS NOT NULL DROP TABLE [{0}].[{1}];".format(schema_name, dim_name),
-        "GO",
-        *create_dim,
-        "GO",
-        "IF OBJECT_ID(N'[{0}].[{1}]', N'U') IS NOT NULL DROP TABLE [{0}].[{1}];".format(schema_name, fact_name),
-        "GO",
-        *create_fact,
-        "GO",
-        "-- Load dimension data",
-        *insert_dim,
-        "GO",
-        "-- Load fact data",
-        *insert_fact,
-        "GO",
+    return [
+        ("Create datawarehouse schema", create_schema),
+        (f"Drop {dim_name}",   f"IF OBJECT_ID(N'[{schema_name}].[{dim_name}]', N'U') IS NOT NULL DROP TABLE [{schema_name}].[{dim_name}];"),
+        (f"Create {dim_name}", "\n".join(create_dim)),
+        (f"Drop {fact_name}",  f"IF OBJECT_ID(N'[{schema_name}].[{fact_name}]', N'U') IS NOT NULL DROP TABLE [{schema_name}].[{fact_name}];"),
+        (f"Create {fact_name}", "\n".join(create_fact)),
+        (f"Load {dim_name}",  "-- Load dimension data\n" + "\n".join(insert_dim)),
+        (f"Load {fact_name}", "-- Load fact data\n"      + "\n".join(insert_fact)),
     ]
 
-    return "\n".join(script_lines)
+
+def generate_package_sql(package_index, source_table, source_columns):
+    batches = _build_sql_batches(package_index, source_table, source_columns)
+    lines = ["SET NOCOUNT ON;", "GO"]
+    for _name, sql in batches:
+        lines.append(sql)
+        lines.append("GO")
+    return "\n".join(lines)
+
+
+_BIML_NS = "http://schemas.varigence.com/biml.xsd"
+
+
+def generate_package_biml(package_index, source_table, source_columns, connection_string):
+    batches = _build_sql_batches(package_index, source_table, source_columns)
+    package_name = f"package_{package_index + 1:02d}"
+    conn_name = "DW"
+
+    # Register as default namespace so serialised output uses no prefix.
+    ET.register_namespace("", _BIML_NS)
+
+    def tag(local):
+        return f"{{{_BIML_NS}}}{local}"
+
+    root = ET.Element(tag("Biml"))
+    connections = ET.SubElement(root, tag("Connections"))
+    ET.SubElement(connections, tag("OleDbConnection"), Name=conn_name, ConnectionString=connection_string)
+    packages = ET.SubElement(root, tag("Packages"))
+    pkg = ET.SubElement(packages, tag("Package"), Name=package_name, ConstraintMode="Linear")
+    tasks = ET.SubElement(pkg, tag("Tasks"))
+    for task_name, sql in batches:
+        task = ET.SubElement(tasks, tag("ExecuteSQL"), Name=task_name, ConnectionName=conn_name)
+        ET.SubElement(task, tag("DirectInput")).text = sql
+
+    ET.indent(root, space="  ")
+    return '<?xml version="1.0" encoding="utf-8"?>\n' + ET.tostring(root, encoding="unicode") + "\n"
 
 
 def write_package(output_dir, index, sql_text):
@@ -297,10 +353,19 @@ def write_package(output_dir, index, sql_text):
     return filename
 
 
+def write_biml_package(output_dir, index, biml_text):
+    filename = os.path.join(output_dir, f"package_{index + 1:02d}.biml")
+    with open(filename, "w", encoding="utf-8") as f:
+        f.write(biml_text)
+    return filename
+
+
 def main():
     args = parse_args()
     if args.username and args.password is None:
         raise SystemExit("Error: --password is required when using --username.")
+    if args.output_format == "biml" and not args.dw_connection:
+        raise SystemExit("Error: --dw-connection is required when --output-format=biml.")
     conn_str = build_connection_string(
         args.server,
         args.database,
@@ -327,14 +392,21 @@ def main():
                 print(f"Skipping {source_table['schema_name']}.{source_table['object_name']} because it has no columns.")
                 continue
 
-            package_sql = generate_package_sql(package_index, source_table, columns)
-            package_path = write_package(output_dir, package_index, package_sql)
+            if args.output_format == "biml":
+                content = generate_package_biml(package_index, source_table, columns, args.dw_connection)
+                package_path = write_biml_package(output_dir, package_index, content)
+            else:
+                content = generate_package_sql(package_index, source_table, columns)
+                package_path = write_package(output_dir, package_index, content)
             package_paths.append(package_path)
             print(f"Generated: {package_path}")
 
         print("\nGeneration complete.")
         print(f"Scripts written to: {output_dir.resolve()}")
-        print("Recommended next step: open the .sql files and validate object names before executing on production.")
+        if args.output_format == "biml":
+            print("Next step: open the .biml files in BimlExpress (VS extension) or BimlStudio to compile into .dtsx packages.")
+        else:
+            print("Recommended next step: open the .sql files and validate object names before executing on production.")
 
 if __name__ == "__main__":
     main()

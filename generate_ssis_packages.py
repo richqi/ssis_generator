@@ -272,7 +272,7 @@ def _build_sql_batches(package_index, source_table, source_columns):
             if c["column_name"] not in [d["column_name"] for d in dims]
         ),
         f"FROM [{source_table['schema_name']}].[{source_table['object_name']}] AS s",
-        f"JOIN [{schema_name}].[{dim_name}] AS d ON d.[SourceId] = s.[ID]",
+        f"JOIN [{schema_name}].[{dim_name}] AS d ON d.[SourceId] = s.[ID];",
     ]
 
     if not any(col["column_name"].upper() == "ID" for col in source_columns):
@@ -296,7 +296,7 @@ def _build_sql_batches(package_index, source_table, source_columns):
             if c["column_name"] not in [d["column_name"] for d in dims]
         )
         insert_fact[3] = f"FROM [{source_table['schema_name']}].[{source_table['object_name']}] AS s"
-        insert_fact[4] = f"CROSS JOIN (SELECT TOP 1 [DimKey] FROM [{schema_name}].[{dim_name}] ORDER BY [DimKey]) AS d"
+        insert_fact[4] = f"CROSS JOIN (SELECT TOP 1 [DimKey] FROM [{schema_name}].[{dim_name}] ORDER BY [DimKey]) AS d;"
 
     return [
         ("Create datawarehouse schema", create_schema),

@@ -4,6 +4,11 @@ All notable changes to this project will be documented here.
 
 ## [Unreleased]
 
+## [0.2.1] — 2026-05-20
+
+### Fixed
+- **Biml fact `INSERT` missing trailing semicolon**: the `CROSS JOIN` line in all generated `Load fact_*` tasks lacked a terminating `;`. SSIS Execute SQL Tasks send each `<DirectInput>` as a standalone statement, so the missing semicolon caused execution failures. Fixed in both the no-`ID` generator branch and all 10 pre-generated `.biml` files in `generated_biml/`.
+
 ## [0.2.0] — 2026-05-19
 
 ### Added

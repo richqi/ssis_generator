@@ -8,6 +8,7 @@ venv/
 
 # Generated output
 generated_sql/
+generated_biml/
 ssis_sql_packages/
 
 # IDE
